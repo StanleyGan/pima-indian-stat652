@@ -1,0 +1,558 @@
+---
+title: "Project652"
+author: "Guo Liang Gan"
+date: "November 14, 2017"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Libraries and reading data
+```{r}
+library(ggplot2)
+library(mice)
+library(dplyr)
+library(VIM)
+library(gam)
+library(caret)
+library(randomForest)
+library(gbm)
+library(e1071)
+
+pima <- read.csv("pima-diabetes.csv")
+#summary(pima)
+names(pima)[names(pima)=="DiabetesPedigreeFunction"] <- "DPF"
+pima$Outcome <- as.factor(pima$Outcome)
+
+#Plausible missing values in Glucose, BloodPressure, SkinThickness, Insulin, BMI, 
+#as it will be absurd to have value 0 for these variables
+```
+
+# Visualizing missing patterns for whole data set
+
+```{r}
+#Replace 0 with N/A for Glucose, BloodPressure, SkinThickness, INsulin and BMI
+missing <- c("Glucose", "BloodPressure", "SkinThickness", "Insulin", "BMI")
+pima <- pima %>%
+  mutate_at(.vars=missing, funs(replace(.,.==0, NA)))
+
+#missing data patterns using mice
+md.pattern(pima)
+
+#Visualize using VIM
+miss.plot <- aggr(pima, numbers=TRUE, sortVars=TRUE, cex.axis=.6, labels=names(pima), ylab=
+                    c("Histogram of Missingness", "Pattern of missingness and proportions"))
+summary(miss.plot)
+```
+
+# Splitting into training and test sets, visualize missing pattern for test and training set
+
+```{r}
+#Split data into training and test set. Test set will not be used until the final stage.
+set.seed(19)  
+testSeq <- sample(1:nrow(pima), 70)  #10%
+train <- pima[-testSeq,]
+test <- pima[testSeq,]
+
+#Distribution of missingness for test and train approx same as whole data set
+aggr(train, numbers=TRUE, sortVars=TRUE, cex.axis=.6, labels=names(train), ylab=
+       c("Histogram of Missingness", "Pattern of missingness and proportions"))
+aggr(test, numbers=TRUE, sortVars=TRUE, cex.axis=.6, labels=names(test), ylab=
+       c("Histogram of Missingness", "Pattern of missingness and proportions"))
+```
+
+# Imputation of missing data using MICE
+```{r, echo=FALSE, cache=TRUE}
+#Impute missing data using mice
+train.impute <- mice(train, m=5, method="pmm",maxit=30, seed=19)
+
+#Impute missing data for test
+test.impute <- mice(test, m=5, method="pmm", maxit=30, seed=19)
+```
+
+# Retrieve imputed data set and visualize the imputed distribution vs original
+### Training
+```{r}
+#Imputed training data
+imp1 <- complete(train.impute, action=1)  #Use only one imputed data set for training
+
+#imp1
+#Insulin
+ggplot(data=subset(pima, !is.na(Insulin)), aes(x=Insulin)) + 
+  geom_density(fill="cyan", alpha=0.3) +
+  geom_density(data=imp1,fill="orange", alpha=0.3) +
+  labs(title="Comparison with original distribution for variable Insulin.
+       \n     Cyan represents original.")
+
+#SkinThickness
+ggplot(data=subset(pima, !is.na(SkinThickness)), aes(x=SkinThickness)) + 
+  geom_density(fill="cyan", alpha=0.3) +
+  geom_density(data=imp1,fill="orange", alpha=0.3) +
+  labs(title="Comparison with original distribution for variable SkinThickness.
+       \n     Cyan represents original.")
+```
+
+### Test
+
+```{r}
+#Imputed test data. Utilize multiple imputed test set for choosing models
+imp.test1 <- complete(test.impute, action=1)
+imp.test2 <- complete(test.impute, action=2)
+imp.test3 <- complete(test.impute, action=3)
+imp.test4 <- complete(test.impute, action=4)
+imp.test5 <- complete(test.impute, action=5)
+
+#imp.test1
+#Insulin
+ggplot(data=subset(pima, !is.na(Insulin)), aes(x=Insulin)) + 
+  geom_density(fill="cyan", alpha=0.3) +
+  geom_density(data=imp.test1,fill="orange", alpha=0.3) +
+  labs(title="Comparison with original distribution for variable Insulin.
+       \n     Cyan represents original.")
+
+#SkinThickness
+ggplot(data=subset(pima, !is.na(SkinThickness)), aes(x=SkinThickness)) + 
+  geom_density(fill="cyan", alpha=0.3) +
+  geom_density(data=imp.test1,fill="orange", alpha=0.3) +
+  labs(title="Comparison with original distribution for variable SkinThickness.
+       \n     Cyan represents original.")
+```
+
+# Preparation for cross validation sets
+```{r}
+#scale and center
+imp1.scale <- data.frame(scale(imp1[,-9], center=TRUE, scale = TRUE))
+imp1.scale$Outcome <- imp1$Outcome
+
+#Cross validation set
+#Split to 5-folds for cross validation using caret. 
+imp1.fold <- createFolds(imp1.scale$Outcome, k=5)
+
+#scale and center
+imp.test1scale <- data.frame(scale(imp.test1[,-9], center=TRUE, scale = TRUE))
+imp.test1scale$Outcome <- imp.test1$Outcome
+imp.test2scale <- data.frame(scale(imp.test2[,-9], center=TRUE, scale = TRUE))
+imp.test2scale$Outcome <- imp.test2$Outcome
+imp.test3scale <- data.frame(scale(imp.test3[,-9], center=TRUE, scale = TRUE))
+imp.test3scale$Outcome <- imp.test3$Outcome
+imp.test4scale <- data.frame(scale(imp.test4[,-9], center=TRUE, scale = TRUE))
+imp.test4scale$Outcome <- imp.test4$Outcome
+imp.test5scale <- data.frame(scale(imp.test5[,-9], center=TRUE, scale = TRUE))
+imp.test5scale$Outcome <- imp.test5$Outcome
+imp.testScale <- list(imp.test1scale, imp.test2scale,
+                      imp.test3scale, imp.test4scale, imp.test5scale)
+```
+
+# Prediction starts here
+### Logistic Regression
+```{r}
+#Compare 5 models: Logistic, GAM, random forest, gbm, svm
+#Not much interactions, stick to singletons
+lm.fit1 <- glm(data=imp1.scale, Outcome ~ .*., family=binomial())
+summary(lm.fit1)
+
+lm.fit2 <- glm(data=imp1.scale, Outcome ~ ., family=binomial())
+summary(lm.fit2)
+
+#Remove high p values
+lm.fit3 <- glm(data=imp1.scale, Outcome ~ Pregnancies + Glucose + BMI + DPF,
+               family=binomial())
+summary(lm.fit3)
+lm.fit4 <- glm(data=imp1.scale, Outcome ~ Pregnancies + Glucose + BMI ,
+               family=binomial())
+summary(lm.fit4)
+anova(lm.fit4, lm.fit3, test="LRT")
+
+lm3.valacc <- rep(NA,5)
+lm4.valacc <- rep(NA,5)
+
+#Cross validate to compare lm3 and lm4
+for (i in 1:5){
+  val.fit1 <- glm(data=imp1.scale[-imp1.fold[[i]], ], Outcome ~ Pregnancies
+                  + Glucose + BMI + DPF, family=binomial())
+  val.fit2 <- glm(data=imp1.scale[-imp1.fold[[i]], ], Outcome ~ Pregnancies
+                  + Glucose + BMI, family=binomial())
+  val.pred1 <- predict(val.fit1, newdata=imp1.scale[imp1.fold[[i]], ])
+  val.pred2 <- predict(val.fit2, newdata=imp1.scale[imp1.fold[[i]], ])
+  val.pred1 <- ifelse(val.pred1 > 0.5, 1, 0)
+  val.pred2 <- ifelse(val.pred2 > 0.5, 1, 0)
+  lm3.valacc[i]<-sum(val.pred1 == imp1.scale[imp1.fold[[i]], "Outcome"])/length(val.pred1)
+  lm4.valacc[i]<-sum(val.pred2 == imp1.scale[imp1.fold[[i]], "Outcome"])/length(val.pred2)
+  }
+mean(lm3.valacc)
+mean(lm4.valacc)  #parsimonious
+```
+
+### GAM
+```{r}
+#GAM
+gam.fit1 <- gam(data=imp1.scale, Outcome ~ s(Pregnancies,4) +
+                  s(Glucose,4) + s(BloodPressure, 4) + s(Insulin,4) +
+                  s(SkinThickness,4) + s(BMI,4) + s(DPF,4) + s(Age,4),
+                family=binomial())
+summary(gam.fit1)
+
+#Remove variables with high p-value
+gam.fit1a <- gam(data=imp1.scale, Outcome ~ Pregnancies + s(Glucose,4) +
+                   s(SkinThickness, 4) + s(BMI,4) + s(DPF,4) + s(Age, 4),
+                 family=binomial())
+summary(gam.fit1a)
+anova(gam.fit1, gam.fit1a)  #Reject null, prefer smaller model
+
+#Remove next highest p-value
+gam.fit1c <- gam(data=imp1.scale, Outcome ~ s(Glucose,4) + 
+                   s(BMI,4) + s(Age, 4), family=binomial())
+summary(gam.fit1c)
+
+#Anova for non-parametric effects suggest linear terms for Glucose
+gam.fit1d <-  gam(data=imp1.scale, Outcome ~ Glucose + s(BMI,4) +
+                    s(Age, 4), family=binomial())
+summary(gam.fit1d)
+anova(gam.fit1d, gam.fit1c) #suggest using linear term for Glucose
+
+gam1c.valacc <- rep(NA,5)
+gam1d.valacc <- rep(NA, 5)
+
+#Cross validate to compare gam.fit1d and gam.fit1c
+for (i in 1:5){
+  val.fit1 <- gam(data=imp1.scale[-imp1.fold[[i]], ], Outcome ~ 
+                    s(Glucose,4) + s(BMI,4) + s(Age, 4),
+                  family=binomial())
+  val.fit2 <- gam(data=imp1.scale[-imp1.fold[[i]], ], Outcome ~ Glucose +
+                    s(BMI,4) + s(Age, 4), family=binomial())
+  val.pred1 <- predict(val.fit1, newdata=imp1.scale[imp1.fold[[i]], ])
+  val.pred2 <- predict(val.fit2, newdata=imp1.scale[imp1.fold[[i]], ])
+  val.pred1 <- ifelse(val.pred1 > 0.5, 1, 0)
+  val.pred2 <- ifelse(val.pred2 > 0.5, 1, 0)
+  gam1c.valacc[i]<-sum(val.pred1 == imp1.scale[imp1.fold[[i]], "Outcome"])/length(val.pred1)
+  gam1d.valacc[i]<-sum(val.pred2 == imp1.scale[imp1.fold[[i]], "Outcome"])/length(val.pred2)
+  }
+
+mean(gam1c.valacc)
+mean(gam1d.valacc)  #parsimonious
+
+#Linear BMI vs splined BMI
+linearBMI.valacc <- rep(NA,5)
+splineBMI.valacc <- rep(NA, 5)
+
+for (i in 1:5){
+  val.fit1 <- gam(data=imp1.scale[-imp1.fold[[i]], ], Outcome ~
+                    Glucose + BMI, family=binomial())
+  val.fit2 <- gam(data=imp1.scale[-imp1.fold[[i]], ], Outcome ~ 
+                    Glucose + s(BMI,4), family=binomial())
+  val.pred1 <- predict(val.fit1, newdata=imp1.scale[imp1.fold[[i]], ])
+  val.pred2 <- predict(val.fit2, newdata=imp1.scale[imp1.fold[[i]], ])
+  val.pred1 <- ifelse(val.pred1 > 0.5, 1, 0)
+  val.pred2 <- ifelse(val.pred2 > 0.5, 1, 0)
+  linearBMI.valacc[i]<-sum(val.pred1 == imp1.scale[imp1.fold[[i]], "Outcome"])/length(val.pred1)
+  splineBMI.valacc[i]<-sum(val.pred2 == imp1.scale[imp1.fold[[i]], "Outcome"])/length(val.pred2)
+  }
+
+mean(linearBMI.valacc)
+mean(splineBMI.valacc)
+
+```
+
+### Random Forest
+
+```{r, cache=TRUE}
+set.seed(19)
+ntrees <- seq(from=100, to=1000, by=50)
+
+rf.valacc <- rep(NA, length(ntrees))
+
+#Choose number of trees based on CV
+for (j in 1:length(ntrees)){
+  temp <- rep(NA,5)
+  for (i in 1:5){
+    rf.fit <- randomForest(Outcome ~ ., data=imp1.scale[-imp1.fold[[i]], ],
+                           mtry=sqrt(8), ntree=ntrees[j], importance=TRUE)
+    rf.pred <- predict(rf.fit, newdata=imp1.scale[imp1.fold[[i]], ])
+    temp[i]<-sum(rf.pred == imp1.scale[imp1.fold[[i]], "Outcome"])/length(rf.pred)
+  }
+  rf.valacc[j] <- mean(temp)
+}
+
+rf.dfvalacc <- as.data.frame(ntrees)
+colnames(rf.dfvalacc) <- "NumOfTrees"
+rf.dfvalacc$Accuracy <- rf.valacc 
+ggplot(data=rf.dfvalacc, aes(x=NumOfTrees, y=Accuracy)) + 
+  geom_point()
+
+#Tried up to 8000 trees, accuracy oscillates around the same region.
+#So just focus on smaller number of trees.
+#Max
+max(rf.valacc)
+max.tree <- ntrees[which.max(rf.valacc)]
+```
+
+### GBM
+```{r, cache=TRUE}
+set.seed(19)
+ntrees <- seq(from=5000, to=12000, by=1000)
+
+boost.valacc <- rep(NA, length(ntrees))
+#Choose number of trees based on CV
+for (j in 1:length(ntrees)){
+  temp <- rep(NA,5)
+  for (i in 1:5){
+    boost.fit <- gbm(as.character(Outcome) ~ .,
+                     data=imp1.scale[-imp1.fold[[i]], ], n.trees=ntrees[j],
+                     distribution = "bernoulli")
+    boost.pred <- predict(boost.fit, newdata=imp1.scale[imp1.fold[[i]], ],
+                          n.trees=ntrees[j], type="response")
+    boost.pred <- ifelse(boost.pred > 0.5, 1, 0)
+    temp[i]<-sum(boost.pred == imp1.scale[imp1.fold[[i]], "Outcome"])/length(boost.pred)
+  }
+  boost.valacc[j] <- mean(temp)
+}
+
+boost.dfvalacc <- as.data.frame(ntrees)
+colnames(boost.dfvalacc) <- "NumOfTrees"
+boost.dfvalacc$Accuracy <- boost.valacc 
+ggplot(data=boost.dfvalacc, aes(x=NumOfTrees, y=Accuracy)) + 
+  geom_point()
+
+max(boost.valacc)
+boost.maxtree <- ntrees[which.max(boost.valacc)]
+```
+
+
+### SVM
+```{r, cache=TRUE}
+#Linear
+set.seed(19)
+costs <- c(10^{-3:1})
+svm.linearValAcc <- rep(NA, length(costs))
+
+for (j in 1:length(costs)){
+  temp <- rep(NA,5)
+  for (i in 1:5){
+    svm.fit <- svm(Outcome ~ ., type="C-classification", cost=costs[j],
+                   kernel="linear", data=imp1.scale[-imp1.fold[[i]], ])
+    svm.pred <- predict(svm.fit, newdata=imp1.scale[imp1.fold[[i]], ])
+    temp[i]<-sum(svm.pred == imp1.scale[imp1.fold[[i]], "Outcome"])/length(svm.pred)
+  }
+  svm.linearValAcc[j] <- mean(temp)
+}
+
+max(svm.linearValAcc)
+max.svmcost <- costs[which.max(svm.linearValAcc)]
+
+#radial
+costs <- c(10^{-3:3})
+gammas <- seq(from=0.5, to=4, by=0.5)
+svm.radialValAcc <- matrix(NA, nrow=length(costs), ncol = length(gammas))
+for (j in 1:length(costs)){
+  for (g in 1:length(gammas)){
+    temp <- rep(NA,5)
+    for (i in 1:5){
+      svm.fit <- svm(Outcome ~ ., type="C-classification", cost=costs[j],
+                     gamma=gammas[g], kernel="radial",
+                     data=imp1.scale[-imp1.fold[[i]], ])
+      svm.pred <- predict(svm.fit, newdata=imp1.scale[imp1.fold[[i]], ])
+      temp[i]<-sum(svm.pred == imp1.scale[imp1.fold[[i]], "Outcome"])/length(svm.pred)
+    }
+    svm.radialValAcc[j, g] <- mean(temp)
+  }
+
+}
+max(svm.radialValAcc) #Linear kernel is better
+max.radial <- which(svm.radialValAcc == max(svm.radialValAcc), arr.ind = TRUE)
+max.radialcost <- costs[max.radial[1]]
+max.radialgamma <- gammas[max.radial[2]]
+```
+
+# Compare all methods on test set
+```{r}
+set.seed(19)
+best.lm <- glm(data=imp1.scale, Outcome ~ Pregnancies +
+                 Glucose + BMI , family=binomial())
+best.gam <- gam(data=imp1.scale, Outcome ~ Glucose + s(BMI,4) +
+                  s(Age, 4), family=binomial())
+best.rf <- randomForest(Outcome ~ ., data=imp1.scale, mtry=sqrt(8),
+                        ntree=max.tree, importance=TRUE)
+best.gbm <- gbm(as.character(Outcome) ~ ., data=imp1.scale, n.trees=boost.maxtree,
+                distribution = "bernoulli")
+best.svm <- svm(Outcome ~ ., type="C-classification", cost=max.svmcost,
+                kernel="linear", data=imp1.scale)
+
+acc <- function(pred, label){
+  return(sum(pred == label)/length(pred))
+}
+
+test.acc <- matrix(NA, nrow=5, ncol = 5)
+for (i in 1:5){
+  lm.pred <- predict(best.lm, newdata=imp.testScale[[i]])
+  lm.pred <- ifelse(lm.pred >0.5, 1, 0)
+  gam.pred <- predict(best.gam, newdata=imp.testScale[[i]])
+  gam.pred <- ifelse(gam.pred >0.5, 1, 0)
+  rf.pred <- predict(best.rf, newdata=imp.testScale[[i]])
+  gbm.pred <- predict(best.gbm, newdata=imp.testScale[[i]],
+                      n.trees=boost.maxtree, type="response")
+  gbm.pred <- ifelse(gbm.pred >0.5, 1, 0)
+  svm.pred <- predict(best.svm, newdata=imp.testScale[[i]])
+  
+  test.label = imp.testScale[[i]]$Outcome
+  test.acc[1,i] <- acc(lm.pred, test.label)
+  test.acc[2,i] <- acc(gam.pred, test.label)
+  test.acc[3,i] <- acc(rf.pred, test.label)
+  test.acc[4,i] <- acc(gbm.pred, test.label)
+  test.acc[5,i] <- acc(svm.pred, test.label)
+}
+
+#1:gam, rf, gbm, svm
+#2:gam, gbm, svm
+#3:gam, gbm, svm
+#4:gam, svm
+#5:gam, gbm, svm
+test.acc <- data.frame(test.acc)
+transform(test.acc, SD=apply(test.acc, 1, sd))
+transform(test.acc, Mean=apply(test.acc,1, mean))
+```
+
+# Techniques to improve SVM
+### PCA
+```{r, cache=TRUE}
+#Summarize PCA information for whole training data
+imp1.scalePCA <- prcomp(imp1.scale[,-9])
+plot(imp1.scalePCA)
+summary(imp1.scalePCA)
+biplot(imp1.scalePCA, cex=0.5, scale=0)
+
+#Cross Validate number of PCs and cost
+costs <- c(10^{-3:3})
+numPca <- 1:8
+svm.pcaLinear <- matrix(NA, nrow=length(costs), ncol = length(numPca))
+for (c in 1:length(costs)){
+  for (p in numPca){
+    temp <- rep(NA,5)
+    for (i in 1:5){
+      mat.impVar <- imp1.scale[-imp1.fold[[i]], -9]
+      pca <- prcomp(mat.impVar)
+      
+      #use p pcs for prediction
+      load <- pca$rotation[,1:p]
+      load <- as.matrix(load)
+      train <- as.matrix(mat.impVar) %*% load
+      train <- as.data.frame(train)
+      train$Outcome <- imp1.scale[-imp1.fold[[i]], 9]
+      mat.valImpVar<- imp1.scale[imp1.fold[[i]], -9]
+      val <- as.matrix(mat.valImpVar) %*% load
+      val <- as.data.frame(val)
+      val$Outcome <- imp1.scale[imp1.fold[[i]], 9]
+      svm.fit <- svm(Outcome ~ ., type="C-classification",
+                     kernel="linear", cost=costs[c], data=train)
+      svm.pred <- predict(svm.fit, newdata=val)
+      temp[i] <- sum(svm.pred == val$Outcome)/length(svm.pred)  
+    }
+  svm.pcaLinear[c,p] <- mean(temp)
+  }
+}
+max(svm.pcaLinear)
+max.svmpca <- which(svm.pcaLinear == max(svm.pcaLinear),
+                    arr.ind = TRUE)  #8 pcs is the best
+max.svmpcaCost <- costs[max.svmpca[1]]
+max.svmpcaPC <- numPca[max.svmpca[2]]
+```
+
+### Feature Selection for SVM (Using Forward Selection)
+```{r, cache=TRUE}
+comb2 <- combn(names(imp1.scale),2)
+svm.featSelValAcc2 <- rep(NA, dim(comb2)[2])
+
+#Forward selection to choose variables for svm
+for (j in 1:dim(comb2)[2]){
+  temp <- rep(NA,5)
+  for (i in 1:5){
+    data <- imp1.scale[-imp1.fold[[i]], comb2[,j]]
+    data$Outcome <- imp1.scale[-imp1.fold[[i]], 9]
+    svm.fit <- svm(Outcome ~ ., type="C-classification", cost=0.1,
+                   kernel="linear", data=data)
+    test <- imp1.scale[imp1.fold[[i]], comb2[,j]]
+    test$Outcome <- imp1.scale[imp1.fold[[i]], 9]
+    svm.pred <- predict(svm.fit, newdata=test)
+    temp[i]<-sum(svm.pred == imp1.scale[imp1.fold[[i]], "Outcome"])/length(svm.pred)
+  }
+  svm.featSelValAcc2[j] <- mean(temp)
+}
+
+best.featSel <- rep(NA,7)
+best.featSelAcc <- rep(NA,7)
+best.featSel[1] <- list(comb2[,which.max(svm.featSelValAcc2)])
+best.featSelAcc[1] <- max(svm.featSelValAcc2)
+remain <- setdiff(names(imp1.scale)[-9], best.featSel[[1]])
+curr <- best.featSel[[1]]
+
+count <- 2
+while (length(remain) != 0){
+  svm.acc <- rep(NA, length(remain))
+  for(k in 1:length(remain)){
+    temp <- rep(NA,5)
+    for (i in 1:5){
+      data <- imp1.scale[-imp1.fold[[i]], c(curr, remain[k])]
+      data$Outcome <- imp1.scale[-imp1.fold[[i]], 9]
+      svm.fit <- svm(Outcome ~ ., type="C-classification", cost=0.1,
+                     kernel="linear", data=data)
+      test <- imp1.scale[imp1.fold[[i]], c(curr,remain[k])]
+      test$Outcome <- imp1.scale[imp1.fold[[i]], 9]
+      svm.pred <- predict(svm.fit, newdata=test)
+      temp[i]<-sum(svm.pred == imp1.scale[imp1.fold[[i]], "Outcome"])/length(svm.pred)
+    }
+    svm.acc[k] <- mean(temp)
+  }
+  
+  max.feat <- remain[which.max(svm.acc)]
+  curr <- c(curr, max.feat)
+  remain <- setdiff(names(imp1.scale)[-9], curr)
+  best.featSel[count] <- list(curr)
+  best.featSelAcc[count] <- max(svm.acc)
+  count <- count + 1
+}
+
+max(best.featSelAcc)
+bestFeat <- best.featSel[which.max(best.featSelAcc)][[1]]
+```
+
+
+# SVM with bestFeat on test sets
+```{r}
+test.acc <- rep(NA,5)
+svm.bestFeat <- svm(Outcome ~ . - Pregnancies, type="C-classification",
+                    cost=0.1, kernel="linear", data=imp1.scale)
+
+for (i in 1:5){
+  svm.pred <- predict(svm.bestFeat, newdata=imp.testScale[[i]])
+  
+  test.label = imp.testScale[[i]]$Outcome
+  test.acc[i] <- acc(svm.pred, test.label)
+}
+test.acc
+mean(test.acc)
+sd(test.acc)
+```
+
+# Majority voting using GAM, GBM and SVM
+```{r}
+test.acc <- rep(NA,5)
+
+for (i in 1:5){
+  gam.pred <- predict(best.gam, newdata=imp.testScale[[i]])
+  gam.pred <- ifelse(gam.pred >0.5, 1, 0)
+  gbm.pred <- predict(best.gbm, newdata=imp.testScale[[i]],
+                      n.trees=boost.maxtree, type="response")
+  gbm.pred <- ifelse(gbm.pred >0.5, 1, 0)
+  svm.pred <- predict(best.svm, newdata=imp.testScale[[i]])
+  
+  temp <- data.frame(gam = gam.pred, gbm=gbm.pred, svm=svm.pred)
+  maj.pred <- apply(temp, 1, function(x) { sum(sum(x == 1) > sum(x == 0)) })
+  
+  test.label = imp.testScale[[i]]$Outcome
+  test.acc[i] <- acc(maj.pred, test.label)
+}
+test.acc
+mean(test.acc)
+sd(test.acc)
+```
